@@ -891,7 +891,7 @@ func TestIntegration_FluxMonitor_Deviation(t *testing.T) {
 	// 1. Configure fake Eth Node to return 10,000 cents when FM initiates price.
 	eth.Context("Flux Monitor initializes price", func(mock *cltest.EthMock) {
 		mock.Register("eth_call", "10000") // 10,000 cents
-		mock.Register("eth_call", "0x5")   // aggregator round: 5
+		mock.Register("eth_call", "0x1")   // aggregator round: 1
 	})
 
 	// 2. Have server respond with 102 for price when FM checks external price
@@ -901,7 +901,7 @@ func TestIntegration_FluxMonitor_Deviation(t *testing.T) {
 	defer assertCalled()
 
 	// 3. Single task ethTx receives configuration from FM init and writes to chain.
-	attemptHash := common.HexToHash("0xb7862c896a6ba2711bccc0410184e46d793ea83b3e05470f1d359ea276d16bb5")
+	attemptHash := cltest.NewHash()
 	confirmedReceipt := ethpkg.TxReceipt{
 		Hash:        attemptHash,
 		BlockNumber: cltest.Int(1),
@@ -944,6 +944,64 @@ func TestIntegration_FluxMonitor_Deviation(t *testing.T) {
 	assert.Equal(t, "0xe6330cf7", overrides.Get("functionSelector").String())
 	assert.Equal(
 		t,
-		"0x0000000000000000000000000000000000000000000000000000000000000006",
+		"0x0000000000000000000000000000000000000000000000000000000000000002",
 		overrides.Get("dataPrefix").String())
+}
+
+func TestIntegration_FluxMonitor_NewRound(t *testing.T) {
+	app, cleanup := cltest.NewApplicationWithKey(t)
+	defer cleanup()
+
+	// 0. Start, connect, and initialize node
+	eth := app.MockCallerSubscriberClient(cltest.Strict)
+	eth.Context("app.StartAndConnect()", func(eth *cltest.EthMock) {
+		eth.Register("eth_getTransactionCount", `0x0100`) // TxManager.ActivateAccount()
+		eth.Register("eth_chainId", app.Store.Config.ChainID())
+	})
+	require.NoError(t, app.StartAndConnect())
+	eth.EventuallyAllCalled(t)
+
+	// 1. Configure fake Eth Node to return 10,000 cents when FM initiates price.
+	eth.Context("Flux Monitor initializes price", func(mock *cltest.EthMock) {
+		mock.Register("eth_call", "10000") // 10,000 cents
+		mock.Register("eth_call", "0x1")   // aggregator round: 1
+	})
+
+	// 2. Have price adapter server respond with 100 for price on initialization,
+	// NOT enough for deviation.
+	priceResponse := `{"data":{"result": 100}}`
+	mockServer, assertCalled := cltest.NewHTTPMockServer(t, http.StatusOK, "POST", priceResponse)
+	defer assertCalled()
+
+	// 3. Prepare new rounds logs subscription to be called by new FM job
+	newRounds := make(chan ethpkg.Log)
+	eth.RegisterSubscription("logs", newRounds)
+
+	// 4. Create FM Job, and ensure no runs because above criteria has no deviation.
+	buffer := cltest.MustReadFile(t, "testdata/flux_monitor_job.json")
+	var job models.JobSpec
+	err := json.Unmarshal(buffer, &job)
+	require.NoError(t, err)
+	job.Initiators[0].InitiatorParams.Feeds = models.Feeds([]string{mockServer.URL})
+
+	j := cltest.CreateJobSpecViaWeb(t, app, job)
+	_ = cltest.WaitForRuns(t, j, app.Store, 0)
+
+	eth.EventuallyAllCalled(t)
+
+	// 5. Send a NewRound log event to trigger a run.
+	log := cltest.LogFromFixture(t, "testdata/new_round_log.json")
+	attemptHash := cltest.NewHash()
+	confirmedReceipt := ethpkg.TxReceipt{
+		Hash:        attemptHash,
+		BlockNumber: cltest.Int(1),
+	}
+	eth.Context("ethTx.Perform() for new round send", func(eth *cltest.EthMock) {
+		eth.Register("eth_sendRawTransaction", attemptHash)         // Initial tx attempt sent
+		eth.Register("eth_getTransactionReceipt", confirmedReceipt) // confirmed for gas bumped txat
+	})
+	newRounds <- log
+	jrs := cltest.WaitForRuns(t, j, app.Store, 1)
+	_ = cltest.WaitForJobRunToPendConfirmations(t, app.Store, jrs[0])
+	eth.EventuallyAllCalled(t)
 }
